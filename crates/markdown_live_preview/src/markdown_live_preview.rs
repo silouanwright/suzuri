@@ -14,21 +14,22 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
 use collections::{HashMap, HashSet};
 use editor::{
-    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey,
+    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions,
     display_map::{
         BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId, RenderBlock,
     },
 };
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, Focusable as _, FontWeight, HighlightStyle, Hsla,
-    ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource, RetainAllImageCache,
-    SharedString, SharedUri, StrikethroughStyle, Subscription, TextStyleRefinement, WeakEntity,
-    Window, actions, img, rems,
+    App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
+    HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
+    RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -56,6 +57,9 @@ struct LivePreviewFoldTag;
 
 const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
+
+mod bibliography;
+pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MarkdownHeadingStyle {
@@ -185,7 +189,6 @@ fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
     (heading / base).max(0.01)
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
-
 pub struct MarkdownLivePreviewSettings {
     pub enabled: bool,
     pub heading_styles: MarkdownHeadingStyles,
@@ -305,6 +308,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(editor.register_action::<editor::actions::Backspace>(
         move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, false, cx)
                 && !delete_adjacent_to_block(&weak_editor, false, cx)
             {
                 cx.propagate();
@@ -315,6 +319,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(
         editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, true, cx)
                 && !delete_adjacent_to_block(&weak_editor, true, cx)
             {
                 cx.propagate();
@@ -330,8 +335,31 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     // editor release every image it decoded.
     let image_cache = RetainAllImageCache::new(cx);
     if let Some(project) = editor.project().cloned() {
+        let bibliography = Bibliography::global(cx);
+        Bibliography::ensure_project(&bibliography, &project, cx);
+        // Restyle citations when a `.bib` finishes parsing, so keys resolve
+        // (or stop resolving) without waiting for the next edit.
+        subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
+            let markers = editor
+                .addon::<LivePreviewAddon>()
+                .and_then(|addon| addon.markers.clone());
+            apply_emphasis_highlights(editor, markers.as_deref(), cx);
+        }));
+        editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
+            project.clone(),
+            cx,
+        ))));
+        // Hovering a resolved cite key shows the reference card; wrapping
+        // (rather than replacing) keeps LSP hovers and the rest of the
+        // semantics surface working.
+        if let Some(semantics) = editor.semantics_provider() {
+            editor.set_semantics_provider(Some(Rc::new(CitationSemanticsProvider::new(
+                semantics, cx,
+            ))));
+        }
         subscriptions.push(cx.subscribe_in(&project, window, {
             let image_cache = image_cache.clone();
+            let bibliography = bibliography.clone();
             move |editor, project, event, window, cx| {
                 let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
                     return;
@@ -339,12 +367,28 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let (changed_images, changed_notes, note_created) = {
+                let (changed_images, changed_notes, note_created, changed_bibs, removed_bibs) = {
                     let worktree = worktree.read(cx);
                     let mut images = Vec::new();
                     let mut notes = Vec::new();
                     let mut created = false;
+                    let mut bibs = Vec::new();
+                    let mut removed_bibs = Vec::new();
                     for (path, _, change) in changes.iter() {
+                        // Unlike images and notes below, `.bib` files do want
+                        // the initial scan's `Loaded`: a worktree that
+                        // finishes scanning after the editor opened is how its
+                        // bibliography gets discovered at all, and reparsing
+                        // one already indexed is idempotent.
+                        if path.extension().is_some_and(|extension| extension == "bib") {
+                            let absolute = worktree.absolutize(path);
+                            if *change == PathChange::Removed {
+                                removed_bibs.push(absolute);
+                            } else {
+                                bibs.push(absolute);
+                            }
+                            continue;
+                        }
                         // `Loaded` is the initial scan reporting what was
                         // already there, not a change; acting on it would
                         // re-decode every image in the project on open.
@@ -367,8 +411,15 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                             notes.push(absolute);
                         }
                     }
-                    (images, notes, created)
+                    (images, notes, created, bibs, removed_bibs)
                 };
+
+                if !changed_bibs.is_empty() {
+                    Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                for path in removed_bibs {
+                    Bibliography::remove_path(&bibliography, &path, cx);
+                }
 
                 if !changed_images.is_empty() {
                     image_cache.update(cx, |image_cache, cx| {
@@ -409,6 +460,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         handle_press: None,
         source_revealed: None,
         last_resize_at: None,
+        image_move: None,
         callout_collapse: Vec::new(),
         _subscriptions: subscriptions,
     });
@@ -459,6 +511,10 @@ struct LivePreviewAddon {
     /// When a resize drag last wrote a width, so selection isn't cleared by
     /// the selection refresh that buffer edits trigger mid-drag.
     last_resize_at: Option<std::time::Instant>,
+    /// The image widget currently being dragged to a new position, with the
+    /// row its line will land above (`None` while the pointer is outside the
+    /// text area). Set from `on_drag_move`, consumed on mouse up.
+    image_move: Option<(Range<Anchor>, Option<u32>)>,
     /// Callouts the reader has expanded or collapsed by clicking their title,
     /// overriding the `+`/`-` their syntax asks for. Anchored, so the state
     /// follows the callout as text above it changes.
@@ -502,6 +558,16 @@ struct MarkerSet {
     /// Pandoc-style citation keys (`@key` including the `@`), styled as
     /// reference chips once the surrounding brackets are concealed.
     citations: Vec<Range<Anchor>>,
+    /// Whole bracketed citation groups (`[...]` inclusive). A citation is
+    /// inserted as one token through completion, so backspacing at a group's
+    /// end (or forward-deleting at its start) removes the whole group.
+    citation_groups: Vec<Range<Anchor>>,
+    /// Bare in-text citation keys (`@key` outside any brackets). Pandoc
+    /// treats these as citations exactly like bracketed ones, and so does
+    /// the styling: chip when the key resolves, red flag when it does not.
+    /// The flagging only starts once the vault has a bibliography with
+    /// entries, which is what keeps `@handles` in bib-less prose unflagged.
+    bare_citations: Vec<Range<Anchor>>,
     /// Bodies of Obsidian `==highlight==` marks, painted with a highlighter
     /// background once the `==` delimiters are concealed.
     highlights: Vec<Range<Anchor>>,
@@ -867,6 +933,7 @@ const ORDERED_MARKER: usize = 5;
 const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
+const CITATION_UNKNOWN: usize = 9;
 const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -892,6 +959,46 @@ fn apply_emphasis_highlights(
     // works in one.
     let highlight_background = cx.theme().status().warning.opacity(0.28);
     let tag_background = cx.theme().status().info_background;
+    let error_color = cx.theme().status().error;
+
+    // A cite key that resolves to no `.bib` entry is the kind of silent error
+    // a submitted paper pays for, so it gets diagnostic styling. Only once
+    // the project has a bibliography with entries, though: someone writing
+    // `[@handle]` in a vault with no `.bib` is not citing anything.
+    let bibliography = Bibliography::global(cx);
+    let mut resolved_citations = markers.map(|markers| markers.citations.clone());
+    let mut unknown_citations = markers.map(|_| Vec::new());
+    if let Some(markers) = markers
+        && (!markers.citations.is_empty() || !markers.bare_citations.is_empty())
+        && bibliography.read(cx).has_entries()
+    {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let bibliography = bibliography.read(cx);
+        let resolves = |range: &Range<Anchor>| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let key = text.strip_prefix('@').unwrap_or(&text);
+            bibliography.contains_key(key)
+        };
+        let mut known = Vec::with_capacity(markers.citations.len());
+        let mut unknown = Vec::new();
+        for range in &markers.citations {
+            if resolves(range) {
+                known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
+            }
+        }
+        for range in &markers.bare_citations {
+            if resolves(range) {
+                known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
+            }
+        }
+        resolved_citations = Some(known);
+        unknown_citations = Some(unknown);
+    }
+
     let sets = [
         (
             STRIKE,
@@ -950,11 +1057,26 @@ fn apply_emphasis_highlights(
         ),
         (
             CITATION,
-            markers.map(|markers| markers.citations.clone()),
+            resolved_citations,
             HighlightStyle {
                 color: Some(accent_color),
                 background_color: Some(citation_background),
                 font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CITATION_UNKNOWN,
+            unknown_citations,
+            HighlightStyle {
+                color: Some(error_color),
+                background_color: Some(citation_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                underline: Some(UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    color: Some(error_color),
+                    wavy: true,
+                }),
                 ..Default::default()
             },
         ),
@@ -2717,6 +2839,58 @@ fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx:
     })
 }
 
+/// Deletes a whole bracketed citation group when a single caret backspaces
+/// at its end or forward-deletes at its start. A citation arrives as one
+/// token through completion, so it should leave the same way; editing a key
+/// letter by letter stays available by moving the cursor inside the group.
+/// Returns false when no caret borders a group so the caller can propagate.
+fn delete_adjacent_citation(weak_editor: &WeakEntity<Editor>, forward: bool, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let groups: Vec<Range<usize>> = editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.markers.as_ref())
+            .map(|markers| {
+                markers
+                    .citation_groups
+                    .iter()
+                    .map(|range| {
+                        range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if groups.is_empty() {
+            return false;
+        }
+        let selections = selection_offset_ranges(editor, &snapshot);
+        let [caret] = selections.as_slice() else {
+            return false;
+        };
+        if caret.start != caret.end {
+            return false;
+        }
+        let head = caret.start;
+        let Some(group) = groups.iter().find(|group| {
+            if forward {
+                group.start == head
+            } else {
+                group.end == head
+            }
+        }) else {
+            return false;
+        };
+        let deletion = MultiBufferOffset(group.start)..MultiBufferOffset(group.end);
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit([(deletion, "")], None, cx);
+        });
+        true
+    })
+}
+
 /// Deletes the row/column currently selected via its handle, if any.
 /// Returns false when there is no selection so the caller can propagate.
 fn delete_selected_table_unit(weak_editor: &WeakEntity<Editor>, cx: &mut App) -> bool {
@@ -3112,6 +3286,23 @@ fn render_table_block(
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         let max_width = block_cx.max_width;
+        // `max_width` includes the editor's horizontal scroll range, so any
+        // long line in the buffer would stretch the table with it. Cap the
+        // grid at the editor's visible width instead and scroll the overflow
+        // inside the block: replace blocks never extend the editor's own
+        // scroll range, so content past the viewport would be unreachable.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(max_width);
+        let grid_max_width =
+            (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+                .max(gpui::px(200.));
         let colors = block_cx.app.theme().colors().clone();
 
         let (active_range, active_editor) = editor
@@ -3172,6 +3363,19 @@ fn render_table_block(
             })
             .unwrap_or((None, None, None));
 
+        // Fixed per-column widths keep every row's cells aligned without
+        // flex growth: growing distributed leftover space equally, which
+        // ballooned short columns whenever the block was wider than the
+        // table's content.
+        let column_width = |weight: f32| gpui::px((weight * 8. + 20.).max(48.));
+        let handle_width = gpui::px(14.);
+        // The grid needs its explicit content width: fixed-width cells only
+        // overflow their rows visually, so without it the scroll container
+        // measures no overflow and refuses to scroll.
+        let grid_width = column_weights
+            .iter()
+            .fold(handle_width, |total, weight| total + column_width(*weight));
+
         let render_cell = |cell_range: &Range<Anchor>,
                            markdown: &Entity<Markdown>,
                            column: usize,
@@ -3228,9 +3432,8 @@ fn render_table_block(
                             .unwrap_or_else(|| "h".into())
                     )
                 })
-                .flex_grow(1.)
-                .flex_basis(gpui::px(weight * 8.))
-                .min_w(gpui::px(48.))
+                .flex_none()
+                .w(column_width(weight))
                 .px_2()
                 .py_1()
                 .min_h(block_cx.line_height + gpui::px(10.))
@@ -3334,7 +3537,6 @@ fn render_table_block(
             cell
         };
 
-        let handle_width = gpui::px(14.);
         let record_press = {
             let weak = editor.clone();
             move |event: &gpui::MouseDownEvent, _: &mut Window, cx: &mut App| {
@@ -3395,7 +3597,7 @@ fn render_table_block(
                 })
         };
 
-        let mut grid = v_flex().flex_grow(1.);
+        let mut grid = v_flex().flex_none().w(grid_width);
         // Column handles.
         grid = grid.child(h_flex().child(div().w(handle_width)).children(
             structure.header.iter().enumerate().map(|(column, _)| {
@@ -3404,9 +3606,8 @@ fn render_table_block(
                 div()
                     .id(("mdlp-column-handle", column))
                     .debug_selector(|| format!("mdlp-column-handle-{column}"))
-                    .flex_grow(1.)
-                    .flex_basis(gpui::px(weight * 8.))
-                    .min_w(gpui::px(48.))
+                    .flex_none()
+                    .w(column_width(weight))
                     .h(gpui::px(10.))
                     .px_2()
                     .cursor_pointer()
@@ -3535,45 +3736,11 @@ fn render_table_block(
             }
         };
         let accent = colors.border_focused;
-        grid = grid.child(
-            h_flex()
-                .items_stretch()
-                .when_some(row_insertion(None), |this, after| {
-                    let bar = div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .h(gpui::px(3.))
-                        .bg(accent);
-                    this.relative().child(if after {
-                        bar.bottom(gpui::px(-2.))
-                    } else {
-                        bar.top(gpui::px(-2.))
-                    })
-                })
-                .on_drag_move::<TableRowDrag>(row_track_drag(None))
-                .child(row_handle(None))
-                .child(
-                    h_flex().items_stretch().flex_grow(1.).children(
-                        header_markdown
-                            .iter()
-                            .enumerate()
-                            .map(|(column, markdown)| {
-                                let empty = Range {
-                                    start: Anchor::Min,
-                                    end: Anchor::Min,
-                                };
-                                let range = structure.header.get(column).unwrap_or(&empty);
-                                render_cell(range, markdown, column, None)
-                            }),
-                    ),
-                ),
-        );
-        for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
-            grid = grid.child(
+        grid =
+            grid.child(
                 h_flex()
                     .items_stretch()
-                    .when_some(row_insertion(Some(row_index)), |this, after| {
+                    .when_some(row_insertion(None), |this, after| {
                         let bar = div()
                             .absolute()
                             .left_0()
@@ -3586,23 +3753,58 @@ fn render_table_block(
                             bar.top(gpui::px(-2.))
                         })
                     })
-                    .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
-                    .child(row_handle(Some(row_index)))
-                    .child(h_flex().items_stretch().flex_grow(1.).children(
-                        row_markdown.iter().enumerate().map(|(column, markdown)| {
-                            let empty = Range {
-                                start: Anchor::Min,
-                                end: Anchor::Min,
-                            };
-                            let range = structure
-                                .rows
-                                .get(row_index)
-                                .and_then(|row| row.get(column))
-                                .unwrap_or(&empty);
-                            render_cell(range, markdown, column, Some(row_index))
-                        }),
-                    )),
+                    .on_drag_move::<TableRowDrag>(row_track_drag(None))
+                    .child(row_handle(None))
+                    .child(
+                        h_flex()
+                            .items_stretch()
+                            .children(header_markdown.iter().enumerate().map(
+                                |(column, markdown)| {
+                                    let empty = Range {
+                                        start: Anchor::Min,
+                                        end: Anchor::Min,
+                                    };
+                                    let range = structure.header.get(column).unwrap_or(&empty);
+                                    render_cell(range, markdown, column, None)
+                                },
+                            )),
+                    ),
             );
+        for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
+            grid =
+                grid.child(
+                    h_flex()
+                        .items_stretch()
+                        .when_some(row_insertion(Some(row_index)), |this, after| {
+                            let bar = div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .h(gpui::px(3.))
+                                .bg(accent);
+                            this.relative().child(if after {
+                                bar.bottom(gpui::px(-2.))
+                            } else {
+                                bar.top(gpui::px(-2.))
+                            })
+                        })
+                        .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
+                        .child(row_handle(Some(row_index)))
+                        .child(h_flex().items_stretch().children(
+                            row_markdown.iter().enumerate().map(|(column, markdown)| {
+                                let empty = Range {
+                                    start: Anchor::Min,
+                                    end: Anchor::Min,
+                                };
+                                let range = structure
+                                    .rows
+                                    .get(row_index)
+                                    .and_then(|row| row.get(column))
+                                    .unwrap_or(&empty);
+                                render_cell(range, markdown, column, Some(row_index))
+                            }),
+                        )),
+                );
         }
 
         let add_column_editor = editor.clone();
@@ -3763,6 +3965,9 @@ fn render_table_block(
         div()
             .pl(gutter_width)
             .w(max_width)
+            // Flex, not block: the table column should take its content
+            // width so the add-row strip and controls hug the grid.
+            .flex()
             .group("mdlp-table")
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
@@ -3771,89 +3976,105 @@ fn render_table_block(
             .on_drop::<TableColumnDrag>(container_column_drop)
             .child(
                 v_flex()
-                    .max_w(max_width * 0.95)
                     .children(controls)
                     .child(
-                        h_flex().items_stretch().child(grid).child(
-                            v_flex()
-                                .w(gpui::px(22.))
-                                .child(
-                                    // Reveal the table's markdown source.
-                                    div()
-                                        .id("mdlp-table-source")
-                                        .h(gpui::px(22.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .text_color(colors.text_muted)
-                                        .opacity(0.)
-                                        .group_hover("mdlp-table", |this| this.opacity(0.7))
-                                        .hover(|this| this.opacity(1.))
-                                        .child(
-                                            Icon::new(IconName::Code)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                        .tooltip(ui::Tooltip::text("Edit table source"))
-                                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            reveal_source_editor
-                                                .update(cx, |editor, cx| {
-                                                    if let Some(addon) =
-                                                        editor.addon_mut::<LivePreviewAddon>()
-                                                    {
-                                                        addon.source_revealed =
-                                                            Some(reveal_source_range.clone());
-                                                    }
-                                                    let snapshot =
-                                                        editor.buffer().read(cx).snapshot(cx);
-                                                    let offset = reveal_source_range
-                                                        .start
-                                                        .to_offset(&snapshot);
-                                                    editor.change_selections(
-                                                        Default::default(),
-                                                        window,
-                                                        cx,
-                                                        |selections| {
-                                                            selections
-                                                                .select_ranges([offset..offset]);
-                                                        },
-                                                    );
-                                                })
-                                                .log_err();
-                                        }),
-                                )
-                                .child(
-                                    // Add column to the right.
-                                    div()
-                                        .id("mdlp-add-column")
-                                        .flex_grow(1.)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .text_color(colors.text_muted)
-                                        .opacity(0.)
-                                        .group_hover("mdlp-table", |this| this.opacity(0.7))
-                                        .hover(|this| this.opacity(1.))
-                                        .child("+")
-                                        .tooltip(ui::Tooltip::text("Add column to the right"))
-                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            add_column_editor
-                                                .update(cx, |editor, cx| {
-                                                    apply_table_structural_change(
-                                                        editor,
-                                                        &add_column_range,
-                                                        TableStructuralChange::AddColumn,
-                                                        cx,
-                                                    );
-                                                })
-                                                .log_err();
-                                        }),
-                                ),
-                        ),
+                        h_flex()
+                            .items_stretch()
+                            .child(
+                                div()
+                                    .id(ElementId::from(block_cx.block_id))
+                                    .debug_selector(|| "mdlp-table-scroll".into())
+                                    .max_w(grid_max_width)
+                                    .overflow_x_scroll()
+                                    .child(grid),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(gpui::px(22.))
+                                    .child(
+                                        // Reveal the table's markdown source.
+                                        div()
+                                            .id("mdlp-table-source")
+                                            .h(gpui::px(22.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_color(colors.text_muted)
+                                            .opacity(0.)
+                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                            .hover(|this| this.opacity(1.))
+                                            .child(
+                                                Icon::new(IconName::Code)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .tooltip(ui::Tooltip::text("Edit table source"))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    reveal_source_editor
+                                                        .update(cx, |editor, cx| {
+                                                            if let Some(addon) = editor
+                                                                .addon_mut::<LivePreviewAddon>(
+                                                            ) {
+                                                                addon.source_revealed = Some(
+                                                                    reveal_source_range.clone(),
+                                                                );
+                                                            }
+                                                            let snapshot = editor
+                                                                .buffer()
+                                                                .read(cx)
+                                                                .snapshot(cx);
+                                                            let offset = reveal_source_range
+                                                                .start
+                                                                .to_offset(&snapshot);
+                                                            editor.change_selections(
+                                                                Default::default(),
+                                                                window,
+                                                                cx,
+                                                                |selections| {
+                                                                    selections.select_ranges([
+                                                                        offset..offset,
+                                                                    ]);
+                                                                },
+                                                            );
+                                                        })
+                                                        .log_err();
+                                                },
+                                            ),
+                                    )
+                                    .child(
+                                        // Add column to the right.
+                                        div()
+                                            .id("mdlp-add-column")
+                                            .flex_grow(1.)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_color(colors.text_muted)
+                                            .opacity(0.)
+                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                            .hover(|this| this.opacity(1.))
+                                            .child("+")
+                                            .tooltip(ui::Tooltip::text("Add column to the right"))
+                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                add_column_editor
+                                                    .update(cx, |editor, cx| {
+                                                        apply_table_structural_change(
+                                                            editor,
+                                                            &add_column_range,
+                                                            TableStructuralChange::AddColumn,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .log_err();
+                                            }),
+                                    ),
+                            ),
                     )
                     .child(
                         // Add row below.
@@ -3895,11 +4116,67 @@ struct ImageResizeDrag {
     content_left_offset: gpui::Pixels,
 }
 
+/// Drag payload for moving an image to another line. Carries the marker range
+/// of the image being moved, which is its whole line — `push_block_rows`
+/// anchors block markers to full lines, and an image only becomes a block
+/// widget when it is alone on its line.
+struct ImageMoveDrag {
+    range: Range<Anchor>,
+}
+
+/// Type tag scoping the row highlight that marks where a dragged image will
+/// land, so clearing it cannot disturb any other row highlight.
+struct ImageDropTarget;
+
 struct EmptyDragPreview;
 
 impl gpui::Render for EmptyDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+/// The chip that trails the pointer while an image is being dragged,
+/// Obsidian-style: a comfortable distance below-right of the mouse, with the
+/// drop cursor and tinted line marking where the image will land.
+///
+/// gpui paints the drag element at `pointer - grab_offset` and ignores
+/// margins on its root, so the chip is placed with an absolutely-positioned
+/// child offset by `grab_offset` plus the trailing distance, which puts it at
+/// a fixed offset from the live pointer.
+struct ImageDragPreview {
+    name: SharedString,
+    grab_offset: gpui::Point<gpui::Pixels>,
+}
+
+impl gpui::Render for ImageDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div().size_0().child(
+            div()
+                .absolute()
+                .left(self.grab_offset.x + px(16.))
+                // Vertically centered on the pointer: half the chip's height.
+                .top(self.grab_offset.y - px(13.))
+                .occlude()
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface_background)
+                        .shadow_md()
+                        .child(
+                            Icon::new(IconName::Image)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(self.name.clone()).size(LabelSize::Small)),
+                ),
+        )
     }
 }
 
@@ -3982,6 +4259,8 @@ fn render_image_block(
         let reveal_range = range.clone();
         let drag_editor = editor.clone();
         let drag_range = range.clone();
+        let move_editor = editor.clone();
+        let move_drag_range = range.clone();
 
         // A direct image element lets the selection border hug the image
         // exactly; reference-style images (no inline destination) fall back
@@ -3990,6 +4269,23 @@ fn render_image_block(
             resolve_image_source(destination, base_directory.as_deref(), &image_cache)
         });
         let muted = block_cx.app.theme().colors().text_muted;
+        let preview_name: SharedString = destination
+            .as_deref()
+            .and_then(|destination| {
+                Path::new(destination)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .map(SharedString::from)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                if alt.is_empty() {
+                    SharedString::from("image")
+                } else {
+                    alt.clone()
+                }
+            });
+        let move_range = range.clone();
         let image_content: gpui::AnyElement = match (&destination, resolved) {
             (Some(_), Some(source)) => {
                 let fallback_alt = alt.clone();
@@ -4026,6 +4322,20 @@ fn render_image_block(
         };
 
         let mut content = div()
+            // `on_drag` is a stateful-element API, and the id must be unique
+            // per block: `Block::Custom` renders this closure with no id scope
+            // of its own, so a shared static id here would make every image
+            // block share one element-state entry — including the pending
+            // mouse-down that arms a drag, letting a different image's
+            // listener claim the gesture and drag the wrong image.
+            .id(block_cx.block_id)
+            // A no-op outside test builds.
+            .debug_selector(|| {
+                format!(
+                    "MDLP-IMAGE-{}",
+                    destination.as_deref().unwrap_or(alt.as_ref())
+                )
+            })
             .relative()
             .border_2()
             .rounded_sm()
@@ -4037,7 +4347,16 @@ fn render_image_block(
                 }
             })
             .when(content_width.is_none(), |this| this.max_w(max_width * 0.66))
-            .child(image_content);
+            .child(image_content)
+            .on_drag(
+                ImageMoveDrag { range: move_range },
+                move |_, grab_offset, _, cx| {
+                    cx.new(|_| ImageDragPreview {
+                        name: preview_name.clone(),
+                        grab_offset,
+                    })
+                },
+            );
 
         if selected {
             content = content
@@ -4123,6 +4442,48 @@ fn render_image_block(
                     })
                     .log_err();
             })
+            // `on_drag_move` fires for every pointer move while the drag is
+            // live, not just those over this block, which is what lets one
+            // image widget follow the pointer across the whole document. Every
+            // image block hears every move, so each only handles its own.
+            .on_drag_move::<ImageMoveDrag>({
+                let editor = move_editor.clone();
+                let range = move_drag_range;
+                move |event, window, cx| {
+                    if event.drag(cx).range != range {
+                        return;
+                    }
+                    let position = event.event.position;
+                    editor
+                        .update(cx, |editor, cx| {
+                            let boundary = editor
+                                .buffer_row_boundary_at_position(position)
+                                .map(|row| row.0);
+                            track_image_drop_target(editor, &range, boundary, window, cx);
+                        })
+                        .log_err();
+                }
+            })
+            // The drop can land anywhere, so it is caught on mouse up rather
+            // than through `on_drop`, which only fires over this block.
+            .on_mouse_up(MouseButton::Left, {
+                let editor = move_editor.clone();
+                move |_, _window, cx| {
+                    let dropped = cx.has_active_drag();
+                    editor
+                        .update(cx, |editor, cx| finish_image_move(editor, dropped, cx))
+                        .log_err();
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let editor = move_editor;
+                move |_, _window, cx| {
+                    let dropped = cx.has_active_drag();
+                    editor
+                        .update(cx, |editor, cx| finish_image_move(editor, dropped, cx))
+                        .log_err();
+                }
+            })
             // `flex()` is load-bearing: gpui's `div()` is `display: block`, so a
             // block child fills its parent's width and the bordered container
             // would stretch to its own `max_w` cap — leaving the selection
@@ -4165,6 +4526,197 @@ fn resize_image_to_width(
     editor.buffer().update(cx, |multibuffer, cx| {
         multibuffer.edit([(start..end, updated)], None, cx);
     });
+}
+
+/// Records the boundary a dragged image would land at and shows it two ways:
+/// the editor's own cursor moves to the drop point — a caret walking through
+/// the text as the reader drags, the same feedback dragging text gives — and
+/// the line the image will land above is tinted. `boundary` means "lands
+/// above this row"; it is `None` when the pointer is outside the text area,
+/// and may be one past the last row.
+fn track_image_drop_target(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    boundary: Option<u32>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let unchanged = editor.addon::<LivePreviewAddon>().is_some_and(|addon| {
+        addon
+            .image_move
+            .as_ref()
+            .is_some_and(|(_, row)| *row == boundary)
+    });
+    if unchanged {
+        return;
+    }
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.image_move = Some((range.clone(), boundary));
+    }
+    editor.clear_row_highlights::<ImageDropTarget>();
+    if let Some(boundary) = boundary {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let max_row = snapshot.max_point().row;
+        let cursor = if boundary > max_row {
+            snapshot.max_point()
+        } else {
+            Point::new(boundary, 0)
+        };
+        let cursor = snapshot.point_to_offset(cursor);
+        let row = boundary.min(max_row);
+        let start = snapshot.anchor_before(Point::new(row, 0));
+        let end = snapshot.anchor_after(Point::new(row, snapshot.line_len(MultiBufferRow(row))));
+        editor.highlight_rows::<ImageDropTarget>(
+            start..end,
+            |cx| {
+                let mut color = cx.theme().colors().text_accent;
+                color.a = 0.2;
+                color
+            },
+            RowHighlightOptions {
+                autoscroll: false,
+                include_gutter: true,
+            },
+            cx,
+        );
+        editor.change_selections(
+            editor::SelectionEffects::default().nav_history(false),
+            window,
+            cx,
+            |selections| {
+                selections.select_ranges([cursor..cursor]);
+            },
+        );
+    }
+    cx.notify();
+}
+
+/// Completes an image move: drops the image on the row the pointer last
+/// indicated, and clears the drag's highlight either way. Runs on every mouse
+/// up, so it must be a no-op when no image is being dragged. `dropped` is
+/// false when the gesture ended without a live drag — the pointer was released
+/// after Escape cancelled it — and the tracked position is then only cleared,
+/// never acted on.
+fn finish_image_move(editor: &mut Editor, dropped: bool, cx: &mut Context<Editor>) {
+    let Some((range, target_row)) = editor
+        .addon_mut::<LivePreviewAddon>()
+        .and_then(|addon| addon.image_move.take())
+    else {
+        return;
+    };
+    editor.clear_row_highlights::<ImageDropTarget>();
+    if let Some(target_row) = target_row
+        && dropped
+    {
+        move_image_to_row(editor, &range, target_row, cx);
+    }
+    cx.notify();
+}
+
+/// Moves an image's whole line so it lands above `target_row`, as one undo
+/// step; `target_row` may be one past the last row, meaning the end of the
+/// document. Moving the line rather than the image span is safe because an
+/// image only becomes a block widget when it is alone on its line.
+///
+/// Blank lines are adjusted around both ends so the image stays a block of its
+/// own: dropped against a paragraph it would otherwise join that paragraph, and
+/// lifted out from between two blank lines it would otherwise leave a widening
+/// gap behind.
+fn move_image_to_row(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    target_row: u32,
+    cx: &mut Context<Editor>,
+) {
+    if editor.read_only(cx) {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let row = range.start.to_point(&snapshot).row;
+    let max_row = snapshot.max_point().row;
+    let target_row = target_row.min(max_row + 1);
+    // Landing above its own line, or above the line under it, leaves the image
+    // exactly where it already is.
+    if target_row == row || target_row == row + 1 {
+        return;
+    }
+
+    let line = |row: u32| -> String {
+        let start = Point::new(row, 0);
+        let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+        snapshot.text_for_range(start..end).collect()
+    };
+    let is_blank = |row: u32| line(row).trim().is_empty();
+    let line_text = line(row);
+
+    // The line's own newline travels with it, or the one in front of it when
+    // the image is the last line in the buffer.
+    let cut = if row < max_row {
+        // An image sitting alone between two blank lines takes one of them
+        // with it, so repeated moves do not widen the gap it leaves behind.
+        let stranded_blank = row > 0 && row + 1 < max_row && is_blank(row - 1) && is_blank(row + 1);
+        let cut_end_row = if stranded_blank { row + 2 } else { row + 1 };
+        Point::new(row, 0)..Point::new(cut_end_row, 0)
+    } else if row > 0 {
+        Point::new(row - 1, snapshot.line_len(MultiBufferRow(row - 1)))
+            ..Point::new(row, snapshot.line_len(MultiBufferRow(row)))
+    } else {
+        Point::new(row, 0)..Point::new(row, snapshot.line_len(MultiBufferRow(row)))
+    };
+
+    let (insert_at, insert_text, prefix_len) = if target_row > max_row {
+        let prefix = if is_blank(max_row) { "\n" } else { "\n\n" };
+        (
+            snapshot.max_point(),
+            format!("{prefix}{line_text}"),
+            prefix.len(),
+        )
+    } else {
+        let prefix = if target_row > 0 && !is_blank(target_row - 1) {
+            "\n"
+        } else {
+            ""
+        };
+        let suffix = if is_blank(target_row) { "" } else { "\n" };
+        (
+            Point::new(target_row, 0),
+            format!("{prefix}{line_text}\n{suffix}"),
+            prefix.len(),
+        )
+    };
+
+    let cut = snapshot.point_to_offset(cut.start)..snapshot.point_to_offset(cut.end);
+    let insert_at = snapshot.point_to_offset(insert_at);
+    // Where the image ends up, in the edited buffer: the insertion point, past
+    // any blank line added in front of it, less whatever the cut removed from
+    // above it.
+    let landed_offset = if cut.end <= insert_at {
+        insert_at + prefix_len - (cut.end - cut.start)
+    } else {
+        insert_at + prefix_len
+    };
+    let mut edits = vec![(cut, String::new()), (insert_at..insert_at, insert_text)];
+    edits.sort_by_key(|(range, _)| range.start);
+
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        // The edit refreshes selections, which would otherwise deselect the
+        // widget the reader just dropped.
+        addon.last_resize_at = Some(std::time::Instant::now());
+    }
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit(edits, None, cx);
+    });
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let landed_row = landed_offset.to_point(&snapshot).row;
+    let start = snapshot.anchor_before(Point::new(landed_row, 0));
+    let end = snapshot.anchor_after(Point::new(
+        landed_row,
+        snapshot.line_len(MultiBufferRow(landed_row)),
+    ));
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.selected_image = Some(start..end);
+    }
 }
 
 fn render_rule_block(
@@ -5327,6 +5879,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges: Vec::new(),
         ordered_markers: Vec::new(),
         citations: Vec::new(),
+        citation_groups: Vec::new(),
+        bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
     };
@@ -5357,6 +5911,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        citation_groups,
+        bare_citations,
         highlights,
         tags,
         ..
@@ -5397,6 +5953,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        citation_groups,
+        bare_citations,
         highlights,
         tags,
     })
@@ -5422,6 +5980,8 @@ struct Extraction<'a> {
     definition_ranges: Vec<Range<Anchor>>,
     ordered_markers: Vec<Range<Anchor>>,
     citations: Vec<Range<Anchor>>,
+    citation_groups: Vec<Range<Anchor>>,
+    bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
 }
@@ -6045,6 +6605,10 @@ impl Extraction<'_> {
                 continue;
             };
             let mut search_from = 0;
+            // Every `[...]` span seen, kept or not, so the bare pass below
+            // never claims a key inside a bracket construct (a rejected
+            // group, a link label, a wikilink).
+            let mut bracket_spans: Vec<Range<usize>> = Vec::new();
             while let Some(open_offset) = region_text[search_from..].find('[') {
                 let open = search_from + open_offset;
                 search_from = open + 1;
@@ -6052,6 +6616,7 @@ impl Extraction<'_> {
                     break;
                 };
                 let close = open + 1 + close_offset;
+                bracket_spans.push(open..close + 1);
                 let inner = &region_text[open + 1..close];
                 if inner.is_empty() || inner.contains('\n') || inner.contains('[') {
                     continue;
@@ -6088,11 +6653,35 @@ impl Extraction<'_> {
                 let reveal = start..end;
                 self.hide(start..start + 1, reveal.clone());
                 self.hide(end - 1..end, reveal.clone());
+                self.citation_groups.push(self.anchor_range(start..end));
                 for key in keys {
                     let range = self.anchor_range(start + 1 + key.start..start + 1 + key.end);
                     self.citations.push(range);
                 }
                 search_from = close + 1;
+            }
+
+            // Pandoc also allows in-text citations with no brackets
+            // (`@hayashi2003 argues`), which is what accepting a bare `@`
+            // completion produces. `citation_keys`'s boundary rules already
+            // reject an email's or URL's infix `@`.
+            for key in citation_keys(region_text) {
+                if bracket_spans
+                    .iter()
+                    .any(|span| span.start < key.end && key.start < span.end)
+                {
+                    continue;
+                }
+                let start = region.start + key.start;
+                let end = region.start + key.end;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                self.bare_citations.push(self.anchor_range(start..end));
             }
         }
         self.prose_regions = regions;

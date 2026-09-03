@@ -1087,6 +1087,321 @@ async fn test_image_size_syntax(cx: &mut TestAppContext) {
     assert_eq!(widths, vec![Some(640.), Some(320.), None]);
 }
 
+/// Drives the drop half of an image drag: moves the image on `row` so it lands
+/// above `target_row`, which is what `finish_image_move` does on mouse up.
+fn drop_image_on_row(cx: &mut EditorTestContext, row: u32, target_row: u32) {
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let range = snapshot.anchor_before(Point::new(row, 0))
+            ..snapshot.anchor_after(Point::new(row, snapshot.line_len(MultiBufferRow(row))));
+        move_image_to_row(editor, &range, target_row, cx);
+    });
+    cx.executor().run_until_parked();
+}
+
+/// The whole gesture, end to end, through real event dispatch: press on one
+/// of two image widgets, drag past the arming threshold, cross the document,
+/// release. This is what catches wiring bugs the unit tests cannot — most
+/// importantly that the image that moves is the one that was pressed, which
+/// broke in the field when every image block shared one element id and any
+/// block's listener could claim the gesture.
+#[gpui::test]
+async fn test_the_full_drag_gesture_moves_the_pressed_image(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇtop\n\n![first](a.png)\n\n![second](b.png)\n\nbottom");
+    cx.executor().run_until_parked();
+
+    let first = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-a.png")
+        .expect("the first image widget should have been laid out");
+
+    // Press the first image and move past gpui's drag-arming threshold.
+    cx.cx.simulate_event(MouseDownEvent {
+        position: first.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.cx.simulate_event(gpui::MouseMoveEvent {
+        position: first.center() + gpui::point(gpui::px(8.), gpui::px(8.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().run_until_parked();
+
+    // Drag to the upper half of the last line, targeting the boundary above
+    // it, and release there.
+    let last_display_row =
+        cx.update_editor(|editor, _, cx| editor.display_snapshot(cx).max_point().row());
+    let last_line = cx.pixel_position_for(editor::DisplayPoint::new(last_display_row, 0));
+    let drop_position = gpui::point(last_line.x, last_line.y - gpui::px(2.));
+    cx.cx.simulate_event(gpui::MouseMoveEvent {
+        position: drop_position,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().run_until_parked();
+    cx.cx.simulate_event(gpui::MouseUpEvent {
+        position: drop_position,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    cx.executor().run_until_parked();
+
+    pretty_assertions::assert_eq!(
+        cx.buffer_text(),
+        "top\n\n![second](b.png)\n\n![first](a.png)\n\nbottom",
+        "the image that moves must be the one that was pressed"
+    );
+}
+
+/// Sweeping a drag across heading widgets and other image widgets must keep
+/// the drop cursor tracking the pointer the whole way; in the field the caret
+/// froze partway through such a sweep while the pointer kept moving.
+#[gpui::test]
+async fn test_drop_tracking_survives_a_sweep_across_widgets(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(
+        "ˇ# Title\n\nintro paragraph\n\n## Section\n\nfirst\n\n![a](a.png)\n\n![b](b.png)\n\nbottom",
+    );
+    cx.executor().run_until_parked();
+
+    let second = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-b.png")
+        .expect("the second image widget should have been laid out");
+    let first = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-a.png")
+        .expect("the first image widget should have been laid out");
+
+    cx.cx.simulate_event(MouseDownEvent {
+        position: second.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.cx.simulate_event(gpui::MouseMoveEvent {
+        position: second.center() + gpui::point(gpui::px(8.), gpui::px(8.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().run_until_parked();
+
+    // Sweep upward through the first image widget and the headings to the
+    // very top of the document, in small steps like a real pointer.
+    let x = first.center().x;
+    let mut y = second.center().y;
+    let top = gpui::px(4.);
+    while y > top {
+        y -= gpui::px(20.);
+        cx.cx.simulate_event(gpui::MouseMoveEvent {
+            position: gpui::point(x, y.max(top)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.executor().run_until_parked();
+    }
+
+    let cursor_row = cx.update_editor(|editor, _, cx| {
+        editor
+            .selections
+            .newest::<Point>(&editor.display_snapshot(cx))
+            .head()
+            .row
+    });
+    assert_eq!(
+        cursor_row, 0,
+        "after sweeping to the top of the document the drop cursor should \
+         have followed the pointer to row 0, not frozen partway"
+    );
+}
+
+/// The pointer-to-boundary mapping that decides where a dragged image lands,
+/// driven against a really painted editor. It is the one piece of the drag
+/// built on hand-rolled geometry, and nothing else would catch it drifting.
+#[gpui::test]
+async fn test_the_pointer_maps_to_the_nearest_row_boundary(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇone\ntwo\nthree\n");
+    cx.executor().run_until_parked();
+
+    // `pixel_position_for` reports the middle of the row, not its top.
+    let row_center = |cx: &mut EditorTestContext, row: u32| {
+        cx.pixel_position_for(editor::DisplayPoint::new(
+            editor::display_map::DisplayRow(row),
+            0,
+        ))
+    };
+    let line_height = row_center(&mut cx, 1).y - row_center(&mut cx, 0).y;
+
+    let boundary_at = |cx: &mut EditorTestContext, position: gpui::Point<gpui::Pixels>| {
+        cx.update_editor(|editor, _, _| {
+            editor
+                .buffer_row_boundary_at_position(position)
+                .map(|row| row.0)
+        })
+    };
+
+    // The upper half of a line maps to the boundary above it, the lower half
+    // to the boundary below.
+    for row in 0..4 {
+        let center = row_center(&mut cx, row);
+        let upper = gpui::point(center.x, center.y - line_height / 4.);
+        let lower = gpui::point(center.x, center.y + line_height / 4.);
+        assert_eq!(
+            boundary_at(&mut cx, upper),
+            Some(row),
+            "the upper half of row {row} should target the boundary above it"
+        );
+        assert_eq!(
+            boundary_at(&mut cx, lower),
+            Some(row + 1),
+            "the lower half of row {row} should target the boundary below it"
+        );
+    }
+
+    // Below every line, so an image can be dropped past the end of the
+    // document rather than only ever above some existing line.
+    let below = row_center(&mut cx, 3);
+    let below = gpui::point(below.x, below.y + line_height * 2.);
+    assert_eq!(boundary_at(&mut cx, below), Some(4));
+}
+
+#[gpui::test]
+async fn test_dragging_an_image_moves_its_whole_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇfirst
+
+        ![shot](a.png)
+
+        last
+    "});
+    cx.executor().run_until_parked();
+
+    drop_image_on_row(&mut cx, 2, 0);
+
+    pretty_assertions::assert_eq!(
+        cx.buffer_text(),
+        indoc::indoc! {"
+            ![shot](a.png)
+
+            first
+
+            last
+        "},
+        "the image should have moved above the first line, taking one of the \
+         blank lines that surrounded it rather than leaving both behind"
+    );
+}
+
+#[gpui::test]
+async fn test_dragging_an_image_down_lands_above_the_target_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇ![shot](a.png)
+        one
+        two
+        three
+    "});
+    cx.executor().run_until_parked();
+
+    // Rows shift up by one once the image line is cut, which the move has to
+    // account for or the image lands a line short.
+    drop_image_on_row(&mut cx, 0, 3);
+
+    pretty_assertions::assert_eq!(
+        cx.buffer_text(),
+        indoc::indoc! {"
+            one
+            two
+
+            ![shot](a.png)
+
+            three
+        "},
+        "the image landed against its neighbours, which in markdown makes it \
+         part of their paragraph instead of a block of its own"
+    );
+}
+
+#[gpui::test]
+async fn test_dragging_an_image_past_the_last_line_appends_it(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇ![shot](a.png)\none\ntwo");
+    cx.executor().run_until_parked();
+
+    // One past the last row is what `buffer_row_at_position` reports when the
+    // pointer is below every line.
+    drop_image_on_row(&mut cx, 0, 3);
+
+    pretty_assertions::assert_eq!(cx.buffer_text(), "one\ntwo\n\n![shot](a.png)");
+}
+
+#[gpui::test]
+async fn test_dragging_the_last_line_image_up_leaves_no_blank_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // No trailing newline, so the image's line has no newline of its own to
+    // travel with; the one in front of it has to move instead.
+    cx.set_state("ˇone\ntwo\n![shot](a.png)");
+    cx.executor().run_until_parked();
+
+    drop_image_on_row(&mut cx, 2, 0);
+
+    pretty_assertions::assert_eq!(cx.buffer_text(), "![shot](a.png)\n\none\ntwo");
+}
+
+#[gpui::test]
+async fn test_dropping_an_image_where_it_already_is_changes_nothing(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let original = indoc::indoc! {"
+        one
+        ![shot](a.png)
+        two
+    "};
+    cx.set_state(&format!("ˇ{original}"));
+    cx.executor().run_until_parked();
+
+    // Landing above its own line, and above the line under it, are both where
+    // the image already sits.
+    drop_image_on_row(&mut cx, 1, 1);
+    pretty_assertions::assert_eq!(cx.buffer_text(), original);
+    drop_image_on_row(&mut cx, 1, 2);
+    pretty_assertions::assert_eq!(cx.buffer_text(), original);
+}
+
+#[gpui::test]
+async fn test_a_moved_image_stays_selected(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇone
+        two
+        ![shot](a.png)
+    "});
+    cx.executor().run_until_parked();
+
+    drop_image_on_row(&mut cx, 2, 0);
+
+    let selected_row = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.selected_image.clone())
+            .map(|range| range.start.to_point(&snapshot).row)
+    });
+    assert_eq!(
+        selected_row,
+        Some(0),
+        "the widget lost its selection border on drop, so its handles vanish \
+         the moment it lands"
+    );
+}
+
 #[test]
 fn test_with_image_width_rewrites_alt() {
     assert_eq!(
@@ -2859,6 +3174,558 @@ async fn test_an_unresolved_embed_reports_itself(cx: &mut TestAppContext) {
     );
 }
 
+/// The keys carried by a highlight namespace, as buffer text, so citation
+/// tests can assert which keys resolved rather than counting ranges.
+fn highlighted_texts(
+    editor: &Entity<Editor>,
+    key: usize,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<String> {
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .text_highlights(HighlightKey::MarkdownLivePreview(key), cx)
+            .map_or(Vec::new(), |(_, ranges)| {
+                ranges
+                    .iter()
+                    .map(|range| snapshot.text_for_range(range.clone()).collect())
+                    .collect()
+            })
+    })
+}
+
+#[gpui::test]
+async fn test_cite_keys_resolve_against_the_vault_bibliography(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "As shown in [@smith2020] and [@missing2024].\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@smith2020"],
+        "the key present in refs.bib keeps the citation chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@missing2024"],
+        "the key absent from refs.bib is flagged unresolved"
+    );
+
+    // Adding the missing entry to the `.bib` clears the flag without
+    // touching the note: the worktree change reloads the index and the
+    // bibliography observer restyles.
+    fs.save(
+        "/vault/refs.bib".as_ref(),
+        &concat!(
+            "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            "@article{missing2024,\n  title = {Found},\n  year = {2024},\n}\n"
+        )
+        .into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update refs.bib");
+    cx.run_until_parked();
+
+    let mut resolved = highlighted_texts(&editor, CITATION, cx);
+    resolved.sort();
+    assert_eq!(
+        resolved,
+        vec!["@missing2024", "@smith2020"],
+        "both keys resolve after the bib gains the entry"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        Vec::<String>::new()
+    );
+}
+
+#[gpui::test]
+async fn test_citations_stay_plain_without_a_bibliography(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[("Note.md", "A hunch [@unverified] in a vault with no bib.\n")],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@unverified"],
+        "citations keep the ordinary chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        Vec::<String>::new(),
+        "no bibliography means no unresolved flags"
+    );
+}
+
+#[gpui::test]
+async fn test_citation_completion_offers_bib_keys(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "cite [@smi"),
+            (
+                "refs.bib",
+                concat!(
+                    "@article{smith2020,\n  title = {A Study of Things},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+                    "@book{knuth1984,\n  title = {The Book},\n  year = {1984},\n}\n"
+                ),
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let task = editor.update_in(cx, |editor, window, cx| {
+        let project = editor
+            .project()
+            .expect("vault editor has a project")
+            .clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("cite [@smi".len());
+        provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        )
+    });
+    let responses = task.await.expect("completions succeed");
+
+    let completions: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .collect();
+    let mut keys: Vec<_> = completions
+        .iter()
+        .map(|completion| completion.new_text.clone())
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["knuth1984", "smith2020"],
+        "every bib entry is offered; the menu filters as the user types"
+    );
+
+    // The replacement covers only the typed key fragment, not the `@`, so
+    // accepting a completion yields `[@smith2020` rather than doubling up.
+    let smith = completions
+        .iter()
+        .find(|completion| completion.new_text == "smith2020")
+        .expect("smith2020 offered");
+    editor.update(cx, |editor, cx| {
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let buffer = buffer.read(cx);
+        let replaced = {
+            use text::ToOffset as _;
+            smith.replace_range.start.to_offset(buffer)..smith.replace_range.end.to_offset(buffer)
+        };
+        assert_eq!(&buffer.text()[replaced], "smi");
+    });
+}
+
+/// A vault often holds several copies of one master bibliography (a
+/// `references.bib` per paper); a key defined in many files is still one
+/// citation and must appear once in the menu.
+#[gpui::test]
+async fn test_duplicate_bib_keys_complete_once(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let shared = "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n";
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "cite [@smi"),
+            ("refs.bib", shared),
+            ("paper-copy.bib", shared),
+            ("another-copy.bib", shared),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let task = editor.update_in(cx, |editor, window, cx| {
+        let project = editor
+            .project()
+            .expect("vault editor has a project")
+            .clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("cite [@smi".len());
+        provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        )
+    });
+    let responses = task.await.expect("completions succeed");
+
+    let keys: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .map(|completion| completion.new_text)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["smith2020"],
+        "a key defined in three .bib files is offered exactly once"
+    );
+}
+
+/// Pandoc also allows in-text citations with no brackets (`@key argues`),
+/// which is what accepting a bare `@` completion produces. They verify
+/// exactly like bracketed ones — chip when resolved, red flag when not —
+/// while emails, infix `@`, and code spans never register at all.
+#[gpui::test]
+async fn test_bare_in_text_citations_chip_and_flag_like_bracketed(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "Bare: @smith2020 argues this, though @somehandle disagrees, \
+                 and me@example.com or `@smith2020` never chip.\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@smith2020"],
+        "the bare key that resolves chips"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@somehandle"],
+        "the bare key that resolves to nothing flags, like a bracketed one"
+    );
+}
+
+/// Outside markdown the provider is a pass-through: `@` never triggers the
+/// citation menu, and a completion request yields no cite keys even with a
+/// populated bibliography — code buffers must feel exactly as before.
+#[gpui::test]
+async fn test_citation_provider_delegates_outside_markdown(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("notes.txt", "plain text @"),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "notes.txt",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let (triggers, task) = editor.update_in(cx, |editor, window, cx| {
+        let project = editor.project().expect("has project").clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("plain text @".len());
+        let triggers = provider.is_completion_trigger(&buffer, position, "@", false, cx);
+        let task = provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        );
+        (triggers, task)
+    });
+    assert!(
+        !triggers,
+        "@ in a non-markdown buffer must not open the menu"
+    );
+
+    let responses = task.await.expect("delegated completions succeed");
+    let cite_keys: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .filter(|completion| completion.new_text == "smith2020")
+        .collect();
+    assert!(
+        cite_keys.is_empty(),
+        "a non-markdown buffer must get no cite-key completions"
+    );
+}
+
+/// Hovering a resolved cite key serves the reference card through the
+/// wrapped semantics provider; anywhere else the provider delegates, so LSP
+/// hovers keep working.
+#[gpui::test]
+async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "See [@smith2020] and email me@smith2020 here.\n"),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study of Things},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let hover_on = |editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext, offset: usize| {
+        editor.update(cx, |editor, cx| {
+            let provider = editor
+                .semantics_provider()
+                .expect("editor has a semantics provider");
+            let buffer = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("single buffer");
+            let position = buffer.read(cx).anchor_before(offset);
+            provider.hover(&buffer, position, cx)
+        })
+    };
+
+    // On the key: the reference card, immediately.
+    let task = hover_on(&editor, cx, "See [@smi".len()).expect("citation hover produced");
+    let hovers = task.await.expect("citation hover resolves");
+    let text = hovers
+        .first()
+        .and_then(|hover| hover.contents.first())
+        .map(|block| block.text.clone())
+        .unwrap_or_default();
+    assert!(
+        text.contains("A Study of Things") && text.contains("Jane Smith") && text.contains("2020"),
+        "hover card should carry the reference, got {text:?}"
+    );
+
+    // On the email's lookalike key: no card (the request delegates).
+    if let Some(task) = hover_on(&editor, cx, "See [@smith2020] and email me@smi".len()) {
+        let hovers = task.await.unwrap_or_default();
+        assert!(
+            hovers.iter().all(|hover| {
+                hover
+                    .contents
+                    .iter()
+                    .all(|block| !block.text.contains("A Study of Things"))
+            }),
+            "an email must not get a reference card"
+        );
+    }
+
+    // End to end: the editor's own hover pipeline pops the card.
+    editor.update_in(cx, |editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(MultiBufferOffset("See [@smi".len()));
+        editor::hover_popover::hover_at(editor, Some(anchor), None, window, cx);
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let popovers = editor.update(cx, |editor, _| editor.hover_state.info_popovers.len());
+    assert_eq!(popovers, 1, "the hover popover should be on screen");
+}
+
+/// Deleting a whole `.bib` file drops its keys from the index the way
+/// deleting one entry does: keys only it provided flag red, keys other
+/// files still carry keep their chips.
+#[gpui::test]
+async fn test_deleting_a_bib_file_flags_its_keys(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "Both chip: [@kept2020] and [@doomed2021].\n"),
+            (
+                "kept.bib",
+                "@article{kept2020,\n  title = {Kept},\n  year = {2020},\n}\n",
+            ),
+            (
+                "doomed.bib",
+                "@article{doomed2021,\n  title = {Doomed},\n  year = {2021},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let mut resolved = highlighted_texts(&editor, CITATION, cx);
+    resolved.sort();
+    assert_eq!(resolved, vec!["@doomed2021", "@kept2020"]);
+
+    fs.remove_file("/vault/doomed.bib".as_ref(), Default::default())
+        .await
+        .expect("failed to delete doomed.bib");
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@kept2020"],
+        "the surviving bib's key keeps its chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@doomed2021"],
+        "the deleted bib's key flags red"
+    );
+}
+
+/// A `.bib` created after the project opened is discovered through the
+/// worktree change event, not the initial scan — and its arrival also turns
+/// verification on, so a key that sat unflagged in a bib-less vault gets its
+/// verdict once entries exist.
+#[gpui::test]
+async fn test_a_bib_created_later_starts_resolving(cx: &mut TestAppContext) {
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[("Note.md", "Cite [@late2020] and [@never2021].\n")],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let mut unverified = highlighted_texts(&editor, CITATION, cx);
+    unverified.sort();
+    assert_eq!(
+        unverified,
+        vec!["@late2020", "@never2021"],
+        "with no bibliography, citations chip without verification"
+    );
+
+    fs.insert_file(
+        "/vault/new.bib",
+        b"@article{late2020,\n  title = {Late Arrival},\n  year = {2020},\n}\n".to_vec(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@late2020"],
+        "the new bib's key resolves"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@never2021"],
+        "verification turns on with the first entries"
+    );
+}
+
+/// A citation arrives as one token through completion, so backspacing right
+/// after `]` (or forward-deleting right before `[`) removes the whole group,
+/// like the block widgets do. With the cursor inside the group, deletion
+/// stays per-character so a key can still be edited.
+#[gpui::test]
+async fn test_backspace_after_a_citation_deletes_the_whole_group(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state("A claim [@doe2020]ˇ stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    // One undo brings the whole citation back as one step.
+    cx.dispatch_action(editor::actions::Undo);
+    cx.assert_editor_state("A claim [@doe2020]ˇ stands\n");
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    cx.set_state("A claim ˇ[@doe2020] stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Delete);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    // Inside the group the ordinary one-character deletion still applies.
+    cx.set_state("A claim [@doe2020ˇ] stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim [@doe202ˇ] stands\n");
+}
+
+#[gpui::test]
+async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) {
+    let cases: &[(&str, Option<usize>)] = &[
+        // Bracketed and bare citations complete after their `@`.
+        ("see [@smi", Some("see [@".len())),
+        ("see @smi", Some("see @".len())),
+        ("@smi", Some(1)),
+        ("[@a; @b", Some("[@a; @".len())),
+        // An email address or infix `@` is not a citation.
+        ("write me@exa", None),
+        // No `@` at all.
+        ("see [smi", None),
+    ];
+    for (text, expected) in cases {
+        let buffer = cx.new(|cx| language::Buffer::local(*text, cx));
+        let start =
+            cx.update(|cx| crate::bibliography::citation_key_start(buffer.read(cx), text.len()));
+        assert_eq!(start, *expected, "context detection for {text:?}");
+    }
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
@@ -3521,4 +4388,165 @@ async fn test_expanded_diff_hunks_reveal_plain_source(cx: &mut TestAppContext) {
         "collapsing the hunks restores native heading typography"
     );
     assert!(cx.display_text().contains("some bold text"));
+}
+
+/// The image drag follows the pointer across the whole document, which only
+/// works because gpui delivers `on_drag_move` to every painted listener of the
+/// dragged type, not just those under the pointer. If upstream started gating
+/// it on the element's bounds, dragging an image would stop tracking the moment
+/// the pointer left the image itself.
+#[gpui::test]
+fn test_drag_move_fires_outside_the_element(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    struct Dragged;
+
+    struct DragSource(Rc<Cell<usize>>);
+
+    impl Render for DragSource {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let moves = self.0.clone();
+            div().size_full().child(
+                div()
+                    .id("source")
+                    .debug_selector(|| "SOURCE".into())
+                    .w(gpui::px(20.))
+                    .h(gpui::px(20.))
+                    .on_drag(Dragged, |_, _, _, cx| cx.new(|_| EmptyDragPreview))
+                    .on_drag_move::<Dragged>(move |_, _, _| {
+                        moves.set(moves.get() + 1);
+                    }),
+            )
+        }
+    }
+
+    let moves = Rc::new(Cell::new(0));
+    let (_view, cx) = cx.add_window_view({
+        let moves = moves.clone();
+        move |_window, _cx| DragSource(moves)
+    });
+    cx.run_until_parked();
+
+    let bounds = cx
+        .debug_bounds("SOURCE")
+        .expect("the drag source should have been laid out");
+    cx.simulate_event(MouseDownEvent {
+        position: bounds.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    // Past the drag threshold, but still over the source, so the drag starts.
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: bounds.center() + gpui::point(gpui::px(8.), gpui::px(0.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.run_until_parked();
+
+    let moves_before = moves.get();
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: bounds.center() + gpui::point(gpui::px(300.), gpui::px(300.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+
+    assert!(
+        moves.get() > moves_before,
+        "gpui stopped delivering `on_drag_move` for pointer moves outside the \
+         dragged element, so an image drag can no longer track the pointer"
+    );
+}
+
+#[gpui::test]
+async fn test_narrow_table_columns_take_content_width(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | R | School | E |
+        | --- | --- | --- |
+        | 1 | Duke | 4.5 |
+    "});
+    cx.executor().run_until_parked();
+
+    let window_width = cx.update_editor(|_, window, _| window.bounds().size.width);
+    let mut total = gpui::px(0.);
+    for column in 0..3 {
+        let bounds = cx
+            .cx
+            .debug_bounds(format!("mdlp-cell-h-{column}").leak())
+            .expect("header cell rendered");
+        assert!(
+            bounds.size.width < gpui::px(120.),
+            "short column {column} should hug its content, got {:?}",
+            bounds.size.width
+        );
+        total += bounds.size.width;
+    }
+    assert!(
+        total < window_width / 2.,
+        "a small table should not stretch across the editor: {total:?} of {window_width:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
+    let separator = "| --- ".repeat(7) + "|";
+    let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";
+    cx.set_state(&format!("ˇplain line\n\n{header}\n{separator}\n{row}\n"));
+    cx.executor().run_until_parked();
+
+    let window_width = cx.update_editor(|_, window, _| window.bounds().size.width);
+    let container = cx
+        .cx
+        .debug_bounds("mdlp-table-scroll")
+        .expect("scroll container rendered");
+    assert!(
+        container.right() <= window_width,
+        "the scroll container must stay within the window: {container:?}"
+    );
+    let last_cell = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-6")
+        .expect("last header cell rendered");
+    assert!(
+        last_cell.right() > window_width,
+        "the grid content should overflow the window before scrolling: {last_cell:?}"
+    );
+
+    // Wheel over the table scrolls the grid in place instead of the editor.
+    cx.cx.simulate_mouse_move(
+        container.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+    cx.cx.simulate_event(gpui::ScrollWheelEvent {
+        position: container.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(-600.), gpui::px(0.))),
+        modifiers: gpui::Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.executor().run_until_parked();
+    cx.update_editor(|_, _, cx| cx.notify());
+    cx.executor().run_until_parked();
+
+    let editor_scroll = cx.update_editor(|editor, _, cx| editor.scroll_position(cx));
+    assert_eq!(
+        editor_scroll.x, 0.0,
+        "the table consumes the horizontal wheel; the editor must not scroll"
+    );
+    let first_cell = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-0")
+        .expect("first header cell rendered");
+    assert!(
+        first_cell.origin.x < container.origin.x,
+        "the grid should have scrolled left: {first_cell:?} vs {container:?}"
+    );
 }
